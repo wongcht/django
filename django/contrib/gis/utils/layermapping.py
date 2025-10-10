@@ -550,7 +550,8 @@ class LayerMapping:
 
         # Attempting to retrieve and return the related model.
         try:
-            return rel_model.objects.using(self.using).get(**fk_kwargs)
+            # Lighter query by only fetching pk
+            return rel_model.objects.using(self.using).only("pk").get(**fk_kwargs)
         except ObjectDoesNotExist:
             raise MissingForeignKey(
                 "No ForeignKey %s model found with keyword arguments: %s"
