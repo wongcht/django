@@ -540,6 +540,11 @@ class LayerMapping:
         Return the GeometryField instance associated with the geographic
         column.
         """
+
+        # Allow layer has no geometry field being mapped
+        if self.geom_field is None:
+            return None
+
         # Use `get_field()` on the model's options so that we
         # get the correct field instance if there's model inheritance.
         opts = self.model._meta
