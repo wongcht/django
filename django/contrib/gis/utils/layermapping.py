@@ -20,6 +20,7 @@ from django.contrib.gis.gdal import (
     OGRGeomType,
     SpatialReference,
 )
+from django.contrib.gis.gdal.feature import Feature
 from django.contrib.gis.gdal.field import (
     OFTDate,
     OFTDateTime,
@@ -739,3 +740,13 @@ class LayerMapping:
         else:
             # Otherwise, just calling the previously defined _save() function.
             _save()
+
+    def bulk_create_all(self, batch_size: int = 1000):
+        # Drawback: Load all features into memory at once
+        features = [
+            self.model(**self.feature_kwargs(feature)) for feature in self.layer
+        ]
+        # The batch_size is only applied to bulk_create, but not overall handling
+        self.model.objects.using(self.using).bulk_create(
+            features, batch_size=batch_size
+        )
