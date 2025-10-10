@@ -10,6 +10,7 @@ import sys
 from decimal import Decimal
 from decimal import InvalidOperation as DecimalInvalidOperation
 from pathlib import Path
+from typing import Optional
 
 from django.contrib.gis.db.models import GeometryField
 from django.contrib.gis.gdal import (
@@ -106,6 +107,7 @@ class LayerMapping:
         transform=True,
         unique=None,
         using=None,
+        faster_verify_fk=False,
     ):
         """
         A LayerMapping object is initialized using the given Model (not an
@@ -128,9 +130,19 @@ class LayerMapping:
         self.mapping = mapping
         self.model = model
 
+        # Flag to enable fetch required FK model pks in batch to avoid N+1 queries
+        self.faster_verify_fk = faster_verify_fk
+        if self.faster_verify_fk:
+            print("Faster foreign key verification is enabled")
+
         # Checking the layer -- initialization of the object will fail if
         # things don't check out before hand.
         self.check_layer()
+
+        self.fk_field_names = self.get_model_fk_field_names()
+
+        # TODO: Improve naming, it stores FK id to actual FK instance pk
+        self.fks_uid_pk_map = {}
 
         # Getting the geometry column associated with the model (an
         # exception will be raised if there is no geometry column).
@@ -341,6 +353,47 @@ class LayerMapping:
                 "Unique keyword argument must be set with a tuple, list, or string."
             )
 
+    # TODO: assign the fk_field_names by other methods
+    def get_model_fk_field_names(self):
+        fk_field_names = []
+        for field_name, ogr_name in self.mapping.items():
+            model_field = self.fields[field_name]
+            if isinstance(model_field, models.base.ModelBase):
+                fk_field_names.append(field_name)
+        return fk_field_names
+
+    # Implement after real batching
+    # def verify_fk_exists(self, field_name: str, fk_ids: list[int]):
+    #     if field_name not in self.fk_field_names:
+    #         raise Exception("Field name not found in fk_field_names")
+
+    #     related_model = self.fields[field_name]
+    #     related_model_pks = related_model.objects.filter(pk__in=fk_ids).values_list(
+    #         "pk", flat=True
+    #     )
+    #     if missing_pks := set(fk_ids) - set(related_model_pks):
+    #         raise Exception(f"Missing {field_name} foreign key ids: {missing_pks}")
+
+    # TODO: Implement real batching
+    def batch_fetch_fk_pks(self, field_name: str, uids: Optional[list[int]] = None):
+        related_model = self.fields[field_name]
+
+        uid_pk_map = {}
+
+        for related_model_column_name, ogr_name_fk in self.mapping[field_name].items():
+            queryset = related_model.objects.all()
+            if uids:
+                queryset = queryset.filter(**{f"{related_model_column_name}__in": uids})
+
+            result = queryset.values_list(related_model_column_name, "pk")
+            for uid, pk in result:
+                uid_pk_map[uid] = pk
+            return uid_pk_map
+
+    def load_fks_uid_pk_map(self):
+        for field_name in self.fk_field_names:
+            self.fks_uid_pk_map[field_name] = self.batch_fetch_fk_pks(field_name)
+
     # Keyword argument retrieval routines.
     def feature_kwargs(self, feat):
         """
@@ -364,7 +417,24 @@ class LayerMapping:
             elif isinstance(model_field, models.base.ModelBase):
                 # The related _model_, not a field was passed in -- indicating
                 # another mapping for the related Model.
-                val = self.verify_fk(feat, model_field, ogr_name)
+                if not self.faster_verify_fk:
+                    val = self.verify_fk(feat, model_field, ogr_name)
+                else:
+                    for rel_model_column_name, ogr_name_fk in ogr_name.items():
+                        # Seems not very helpful
+                        fk_val = self.verify_ogr_field(feat[ogr_name_fk], model_field)
+                        if fk_val not in self.fks_uid_pk_map[field_name]:
+                            # TODO: batch matching to report all missing fk ids
+                            raise Exception(
+                                f"Missing {field_name} foreign key ids: {fk_val}"
+                            )
+                        else:
+                            rel_model_pk = self.fks_uid_pk_map[field_name][fk_val]
+                            val = rel_model_pk
+                            # TODO: Validate it is always correct
+                            field_name = f"{field_name}_id"
+                        # Should only have one key inside the dict
+                        break
             else:
                 # Otherwise, verify OGR Field type.
                 val = self.verify_ogr_field(feat[ogr_name], model_field)
@@ -461,6 +531,7 @@ class LayerMapping:
             val = ogr_field.value
         return val
 
+    # Will be removed
     def verify_fk(self, feat, rel_model, rel_mapping):
         """
         Given an OGR Feature, the related model and its dictionary mapping,
@@ -622,6 +693,9 @@ class LayerMapping:
             else:
                 progress_interval = progress
 
+        if self.faster_verify_fk:
+            self.load_fks_uid_pk_map()
+
         def _save(feat_range=default_range, num_feat=0, num_saved=0):
             if feat_range:
                 layer_iter = self.layer[feat_range]
@@ -742,10 +816,26 @@ class LayerMapping:
             _save()
 
     def bulk_create_all(self, batch_size: int = 1000):
-        # Drawback: Load all features into memory at once
-        features = [
-            self.model(**self.feature_kwargs(feature)) for feature in self.layer
-        ]
+        if self.faster_verify_fk:
+            self.load_fks_uid_pk_map()
+
+            all_features_kwargs = [
+                self.feature_kwargs(feature) for feature in self.layer
+            ]
+            for fk_field_name in self.fk_field_names:
+                uids = [kwargs[fk_field_name + "_id"] for kwargs in all_features_kwargs]
+                if missing_uids := set(uids) - set(
+                    self.fks_uid_pk_map[fk_field_name].values()
+                ):
+                    raise Exception(
+                        f"Missing {fk_field_name} foreign key ids: {missing_uids}"
+                    )
+            features = [self.model(**kwargs) for kwargs in all_features_kwargs]
+        else:
+            # Drawback: Load all features into memory at once
+            features = [
+                self.model(**self.feature_kwargs(feature)) for feature in self.layer
+            ]
         # The batch_size is only applied to bulk_create, but not overall handling
         self.model.objects.using(self.using).bulk_create(
             features, batch_size=batch_size
