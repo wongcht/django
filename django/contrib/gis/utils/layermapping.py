@@ -829,28 +829,33 @@ class LayerMapping:
         if current_batch:
             yield current_batch
 
-    def bulk_create_all(self, batch_size: int = 1000):
+    def _bulk_create_batch(self, features_batch: list[Feature]):
+        """
+        Given a batch of features, bulk create these features.
+        """
         if self.faster_verify_fk:
-            self.load_fks_uid_pk_map()
-
-            all_features_kwargs = [
-                self.feature_kwargs(feature) for feature in self.layer
+            features_kwargs = [
+                self.feature_kwargs(feature) for feature in features_batch
             ]
+            # Verify FK existence
             for fk_field_name in self.fk_field_names:
-                uids = [kwargs[fk_field_name + "_id"] for kwargs in all_features_kwargs]
+                uids = [kwargs[fk_field_name + "_id"] for kwargs in features_kwargs]
                 if missing_uids := set(uids) - set(
                     self.fks_uid_pk_map[fk_field_name].values()
                 ):
                     raise Exception(
                         f"Missing {fk_field_name} foreign key ids: {missing_uids}"
                     )
-            features = [self.model(**kwargs) for kwargs in all_features_kwargs]
+            features = [self.model(**kwargs) for kwargs in features_kwargs]
         else:
-            # Drawback: Load all features into memory at once
             features = [
-                self.model(**self.feature_kwargs(feature)) for feature in self.layer
+                self.model(**self.feature_kwargs(feature)) for feature in features_batch
             ]
-        # The batch_size is only applied to bulk_create, but not overall handling
-        self.model.objects.using(self.using).bulk_create(
-            features, batch_size=batch_size
-        )
+        self.model.objects.using(self.using).bulk_create(features)
+
+    def bulk_create_all(self, batch_size: int = 1000):
+        if self.faster_verify_fk:
+            self.load_fks_uid_pk_map()
+        # TODO: optional transition.atomic
+        for features_batch in self._split_layer(batch_size):
+            self._bulk_create_batch(features_batch)
