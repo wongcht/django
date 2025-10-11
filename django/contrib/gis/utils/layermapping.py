@@ -7,6 +7,7 @@ For more information, please consult the GeoDjango documentation:
   https://docs.djangoproject.com/en/dev/ref/contrib/gis/layermapping/
 """
 import sys
+from contextlib import nullcontext
 from decimal import Decimal
 from decimal import InvalidOperation as DecimalInvalidOperation
 from pathlib import Path
@@ -856,6 +857,12 @@ class LayerMapping:
     def bulk_create_all(self, batch_size: int = 1000):
         if self.faster_verify_fk:
             self.load_fks_uid_pk_map()
-        # TODO: optional transition.atomic
-        for features_batch in self._split_layer(batch_size):
-            self._bulk_create_batch(features_batch)
+
+        context = (
+            transaction.atomic()
+            if self.transaction_mode == "commit_on_success"
+            else nullcontext()
+        )
+        with context:
+            for features_batch in self._split_layer(batch_size):
+                self._bulk_create_batch(features_batch)
