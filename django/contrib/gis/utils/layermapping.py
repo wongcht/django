@@ -816,6 +816,19 @@ class LayerMapping:
             # Otherwise, just calling the previously defined _save() function.
             _save()
 
+    def _split_layer(self, batch_size: int = 1000):
+        """
+        Split the features in the layer into batches of the given size.
+        """
+        current_batch = []
+        for feature in self.layer:
+            current_batch.append(feature)
+            if len(current_batch) >= batch_size:
+                yield current_batch
+                current_batch = []
+        if current_batch:
+            yield current_batch
+
     def bulk_create_all(self, batch_size: int = 1000):
         if self.faster_verify_fk:
             self.load_fks_uid_pk_map()
