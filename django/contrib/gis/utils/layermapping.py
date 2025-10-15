@@ -10,6 +10,7 @@ import sys
 from contextlib import nullcontext
 from decimal import Decimal
 from decimal import InvalidOperation as DecimalInvalidOperation
+from itertools import islice
 from pathlib import Path
 from typing import Any, Optional
 
@@ -825,14 +826,9 @@ class LayerMapping:
         """
         Split the features in the layer into batches of the given size.
         """
-        current_batch = []
-        for feature in self.layer:
-            current_batch.append(feature)
-            if len(current_batch) >= batch_size:
-                yield current_batch
-                current_batch = []
-        if current_batch:
-            yield current_batch
+        iterator = iter(self.layer)
+        while batch := list(islice(iterator, batch_size)):
+            yield batch
 
     def _bulk_create_batch(
         self,
