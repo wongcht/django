@@ -573,6 +573,10 @@ class LayerMapping:
         if self.coord_dim == 2 and geom.is_3d:
             geom.set_3d(False)
 
+        # Downgrade a curved geom to a linear one so that it can be saved
+        if geom.has_curve:
+            geom = geom.get_linear_geometry()
+
         if self.make_multi(geom.geom_type, model_field):
             # Constructing a multi-geometry type to contain the single geometry
             multi_type = self.MULTI_TYPES[geom.geom_type.num]
