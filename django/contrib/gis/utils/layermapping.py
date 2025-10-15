@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from decimal import Decimal
 from decimal import InvalidOperation as DecimalInvalidOperation
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from django.contrib.gis.db.models import GeometryField
 from django.contrib.gis.gdal import (
@@ -830,13 +830,22 @@ class LayerMapping:
         if current_batch:
             yield current_batch
 
-    def _bulk_create_batch(self, features_batch: list[Feature]):
+    def _bulk_create_batch(
+        self,
+        features_batch: list[Feature],
+        overwrite_kwargs: Optional[dict[str, Any]] = None,
+    ):
         """
         Given a batch of features, bulk create these features.
         """
+
+        if not overwrite_kwargs:
+            overwrite_kwargs = {}
+
         if self.faster_verify_fk:
             features_kwargs = [
-                self.feature_kwargs(feature) for feature in features_batch
+                {**self.feature_kwargs(feature), **overwrite_kwargs}
+                for feature in features_batch
             ]
             # Verify FK existence
             for fk_field_name in self.fk_field_names:
@@ -850,11 +859,14 @@ class LayerMapping:
             features = [self.model(**kwargs) for kwargs in features_kwargs]
         else:
             features = [
-                self.model(**self.feature_kwargs(feature)) for feature in features_batch
+                self.model(**{**self.feature_kwargs(feature), **overwrite_kwargs})
+                for feature in features_batch
             ]
         self.model.objects.using(self.using).bulk_create(features)
 
-    def bulk_create_all(self, batch_size: int = 1000):
+    def bulk_create_all(
+        self, overwrite_kwargs: Optional[dict[str, Any]] = None, batch_size: int = 1000
+    ):
         if self.faster_verify_fk:
             self.load_fks_uid_pk_map()
 
@@ -865,4 +877,4 @@ class LayerMapping:
         )
         with context:
             for features_batch in self._split_layer(batch_size):
-                self._bulk_create_batch(features_batch)
+                self._bulk_create_batch(features_batch, overwrite_kwargs)
