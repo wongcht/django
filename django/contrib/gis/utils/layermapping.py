@@ -12,7 +12,7 @@ from decimal import Decimal
 from decimal import InvalidOperation as DecimalInvalidOperation
 from itertools import islice
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from django.contrib.gis.db.models import GeometryField
 from django.contrib.gis.gdal import (
@@ -35,6 +35,7 @@ from django.contrib.gis.gdal.field import (
 )
 from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
 from django.db import connections, models, router, transaction
+from django.db.models import QuerySet
 from django.utils.encoding import force_str
 
 
@@ -57,6 +58,10 @@ class InvalidInteger(LayerMapError):
 
 class MissingForeignKey(LayerMapError):
     pass
+
+
+def default_filter_func(feature: Feature) -> bool:
+    return True
 
 
 class LayerMapping:
@@ -212,7 +217,7 @@ class LayerMapping:
         # The geometry field of the model is set here.
         # TODO: Support more than one geometry field / model. However, this
         # depends on the GDAL Driver in use.
-        self.geom_field = False
+        self.geom_field = None
         self.fields = {}
 
         # Getting lists of the field names and the field types available in
@@ -833,11 +838,17 @@ class LayerMapping:
     def _bulk_create_batch(
         self,
         features_batch: list[Feature],
+        filter_func: Callable[[Feature], bool] = default_filter_func,
         overwrite_kwargs: Optional[dict[str, Any]] = None,
+        ignore_conflicts: bool = False,
     ):
         """
         Given a batch of features, bulk create these features.
+
+        Return number of features created
         """
+
+        parent_models = self.model._meta.get_parent_list()
 
         if not overwrite_kwargs:
             overwrite_kwargs = {}
@@ -846,6 +857,7 @@ class LayerMapping:
             features_kwargs = [
                 {**self.feature_kwargs(feature), **overwrite_kwargs}
                 for feature in features_batch
+                if filter_func(feature)
             ]
             # Verify FK existence
             for fk_field_name in self.fk_field_names:
@@ -861,11 +873,43 @@ class LayerMapping:
             features = [
                 self.model(**{**self.feature_kwargs(feature), **overwrite_kwargs})
                 for feature in features_batch
+                if filter_func(feature)
             ]
-        self.model.objects.using(self.using).bulk_create(features)
+        if len(parent_models) > 0:
+            for feature in features:
+                feature.save(using=self.using)
+            # TODO: Implement bulk create, the following code is not working
+            # parent_model = parent_models[0]
+            # parent_field = self.model._meta.parents[parent_model]
+            # local_fields = self.model._meta.local_fields
+
+            # parent_instances = [parent_model() for _ in range(len(features))]
+            # parent_model.objects.using(self.using).bulk_create(
+            #     parent_instances, ignore_conflicts=ignore_conflicts
+            # )
+            # for feature, parent_instance in zip(features, parent_instances):
+            #     setattr(feature, parent_field.name, parent_instance)
+
+            # queryset = QuerySet(self.model)
+            # queryset._for_write = True
+            # with transaction.atomic(using=queryset.db, savepoint=False):
+            #     queryset._batched_insert(
+            #         features,
+            #         local_fields,
+            #         batch_size=None,
+            #     )
+        else:
+            self.model.objects.using(self.using).bulk_create(
+                features, ignore_conflicts=ignore_conflicts
+            )
+        return len(features)
 
     def bulk_create_all(
-        self, overwrite_kwargs: Optional[dict[str, Any]] = None, batch_size: int = 1000
+        self,
+        filter_func: Optional[Callable[[Feature], bool]] = None,
+        overwrite_kwargs: Optional[dict[str, Any]] = None,
+        batch_size: int = 1000,
+        ignore_conflicts: bool = False,
     ):
         if self.faster_verify_fk:
             self.load_fks_uid_pk_map()
@@ -875,6 +919,14 @@ class LayerMapping:
             if self.transaction_mode == "commit_on_success"
             else nullcontext()
         )
+        total_count = 0
         with context:
             for features_batch in self._split_layer(batch_size):
-                self._bulk_create_batch(features_batch, overwrite_kwargs)
+                created_count = self._bulk_create_batch(
+                    features_batch,
+                    filter_func=filter_func or default_filter_func,
+                    overwrite_kwargs=overwrite_kwargs,
+                    ignore_conflicts=ignore_conflicts,
+                )
+                total_count += created_count
+                print(f"Bulk created {total_count} features so far...")
