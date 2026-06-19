@@ -18,7 +18,7 @@ class GEOSCoordSeq(GEOSBase):
 
     ptr_type = CS_PTR
 
-    def __init__(self, ptr, z=False):
+    def __init__(self, ptr, z=False, owned=False):
         "Initialize from a GEOS pointer."
         # TODO when dropping support for GEOS 3.13 the z argument can be
         # deprecated in favor of using the GEOS function GEOSCoordSeq_hasZ.
@@ -26,6 +26,12 @@ class GEOSCoordSeq(GEOSBase):
             raise TypeError("Coordinate sequence should initialize with a CS_PTR.")
         self._ptr = ptr
         self._z = z
+        if owned:
+            # Only an independently-allocated sequence (e.g. from clone())
+            # may be freed. GEOSGeom_getCoordSeq() returns a sequence owned
+            # by its parent Geometry, which frees it; destroying it here too
+            # would be a double free.
+            self.destructor = capi.cs_destroy
 
     def __iter__(self):
         "Iterate over each point in the coordinate sequence."
@@ -239,7 +245,7 @@ class GEOSCoordSeq(GEOSBase):
     # ### Other Methods ###
     def clone(self):
         "Clone this coordinate sequence."
-        return GEOSCoordSeq(capi.cs_clone(self.ptr), self.hasz)
+        return GEOSCoordSeq(capi.cs_clone(self.ptr), self.hasz, owned=True)
 
     @property
     def kml(self):

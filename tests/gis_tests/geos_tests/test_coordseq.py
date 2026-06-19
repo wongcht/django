@@ -147,3 +147,41 @@ class GEOSCoordSeqTest(SimpleTestCase):
         ):
             with self.assertRaisesMessage(NotImplementedError, msg):
                 coord_seq.hasm
+
+
+class GEOSCoordSeqDestructorTests(SimpleTestCase):
+    """
+    GEOSCoordSeq wraps two different kinds of GEOS pointers: an
+    independently-allocated copy returned by clone() (and thus coord_seq),
+    which must be freed, and a pointer borrowed from a parent GEOSGeometry
+    via GEOSGeom_getCoordSeq() (GEOSGeometry._cs), which is freed when the
+    parent geometry itself is destroyed and must not be freed separately.
+    """
+
+    def test_clone_destroys_owned_pointer(self):
+        ls = LineString((0, 0), (1, 1))
+        with patch.object(capi, "cs_destroy") as destroy:
+            cs = ls.coord_seq
+            ptr = cs.ptr
+            del cs
+        destroy.assert_called_once_with(ptr)
+
+    def test_borrowed_coord_seq_is_never_destroyed(self):
+        ls = LineString((0, 0), (1, 1))
+        with patch.object(capi, "cs_destroy") as destroy:
+            del ls._cs
+        destroy.assert_not_called()
+
+    def test_unowned_construction_leaks_by_design(self):
+        """
+        This reproduces the bug that owned=True fixes: building a
+        GEOSCoordSeq from a clone() without owned=True -- the only behavior
+        available before the `owned` parameter was added -- never binds a
+        destructor, so __del__ is a no-op and the cloned GEOS allocation is
+        never freed.
+        """
+        ls = LineString((0, 0), (1, 1))
+        with patch.object(capi, "cs_destroy") as destroy:
+            cs = GEOSCoordSeq(capi.cs_clone(ls._cs.ptr), ls._cs.hasz)
+            del cs
+        destroy.assert_not_called()

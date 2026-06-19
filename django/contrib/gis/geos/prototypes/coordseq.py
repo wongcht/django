@@ -83,9 +83,10 @@ class CsUnaryPredicate(GEOSFuncFactory):
 
 # ## Coordinate Sequence ctypes prototypes ##
 
-# Coordinate Sequence constructors & cloning.
+# Coordinate Sequence constructors, cloning, & destruction.
 cs_clone = CsOutput("GEOSCoordSeq_clone", argtypes=[CS_PTR])
 create_cs = CsOutput("GEOSCoordSeq_create", argtypes=[c_uint, c_uint])
+cs_destroy = GEOSFuncFactory("GEOSCoordSeq_destroy", argtypes=[CS_PTR])
 get_cs = CsOutput("GEOSGeom_getCoordSeq", argtypes=[GEOM_PTR])
 
 # Getting, setting ordinate
