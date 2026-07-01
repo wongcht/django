@@ -8,9 +8,12 @@ For more information, please consult the GeoDjango documentation:
 """
 
 import sys
+from contextlib import nullcontext
 from decimal import Decimal
 from decimal import InvalidOperation as DecimalInvalidOperation
+from itertools import islice
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 from django.contrib.gis.db.models import GeometryField
 from django.contrib.gis.gdal import (
@@ -21,6 +24,7 @@ from django.contrib.gis.gdal import (
     OGRGeomType,
     SpatialReference,
 )
+from django.contrib.gis.gdal.feature import Feature
 from django.contrib.gis.gdal.field import (
     OFTDate,
     OFTDateTime,
@@ -32,6 +36,7 @@ from django.contrib.gis.gdal.field import (
 )
 from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
 from django.db import connections, models, router, transaction
+from django.db.models import QuerySet
 from django.utils.encoding import force_str
 
 
@@ -54,6 +59,10 @@ class InvalidInteger(LayerMapError):
 
 class MissingForeignKey(LayerMapError):
     pass
+
+
+def default_filter_func(feature: Feature) -> bool:
+    return True
 
 
 class LayerMapping:
@@ -106,6 +115,7 @@ class LayerMapping:
         transform=True,
         unique=None,
         using=None,
+        faster_verify_fk=False,
     ):
         """
         A LayerMapping object is initialized using the given Model (not an
@@ -128,9 +138,19 @@ class LayerMapping:
         self.mapping = mapping
         self.model = model
 
+        # Flag to enable fetch required FK model pks in batch to avoid N+1 queries
+        self.faster_verify_fk = faster_verify_fk
+        if self.faster_verify_fk:
+            print("Faster foreign key verification is enabled")
+
         # Checking the layer -- initialization of the object will fail if
         # things don't check out before hand.
         self.check_layer()
+
+        self.fk_field_names = self.get_model_fk_field_names()
+
+        # TODO: Improve naming, it stores FK id to actual FK instance pk
+        self.fks_uid_pk_map = {}
 
         # Getting the geometry column associated with the model (an
         # exception will be raised if there is no geometry column).
@@ -198,7 +218,7 @@ class LayerMapping:
         # The geometry field of the model is set here.
         # TODO: Support more than one geometry field / model. However, this
         # depends on the GDAL Driver in use.
-        self.geom_field = False
+        self.geom_field = None
         self.fields = {}
 
         # Getting lists of the field names and the field types available in
@@ -341,6 +361,47 @@ class LayerMapping:
                 "Unique keyword argument must be set with a tuple, list, or string."
             )
 
+    # TODO: assign the fk_field_names by other methods
+    def get_model_fk_field_names(self):
+        fk_field_names = []
+        for field_name, ogr_name in self.mapping.items():
+            model_field = self.fields[field_name]
+            if isinstance(model_field, models.base.ModelBase):
+                fk_field_names.append(field_name)
+        return fk_field_names
+
+    # Implement after real batching
+    # def verify_fk_exists(self, field_name: str, fk_ids: list[int]):
+    #     if field_name not in self.fk_field_names:
+    #         raise Exception("Field name not found in fk_field_names")
+
+    #     related_model = self.fields[field_name]
+    #     related_model_pks = related_model.objects.filter(pk__in=fk_ids).values_list(
+    #         "pk", flat=True
+    #     )
+    #     if missing_pks := set(fk_ids) - set(related_model_pks):
+    #         raise Exception(f"Missing {field_name} foreign key ids: {missing_pks}")
+
+    # TODO: Implement real batching
+    def batch_fetch_fk_pks(self, field_name: str, uids: Optional[list[int]] = None):
+        related_model = self.fields[field_name]
+
+        uid_pk_map = {}
+
+        for related_model_column_name, ogr_name_fk in self.mapping[field_name].items():
+            queryset = related_model.objects.all()
+            if uids:
+                queryset = queryset.filter(**{f"{related_model_column_name}__in": uids})
+
+            result = queryset.values_list(related_model_column_name, "pk")
+            for uid, pk in result:
+                uid_pk_map[uid] = pk
+            return uid_pk_map
+
+    def load_fks_uid_pk_map(self):
+        for field_name in self.fk_field_names:
+            self.fks_uid_pk_map[field_name] = self.batch_fetch_fk_pks(field_name)
+
     # Keyword argument retrieval routines.
     def feature_kwargs(self, feat):
         """
@@ -364,7 +425,24 @@ class LayerMapping:
             elif isinstance(model_field, models.base.ModelBase):
                 # The related _model_, not a field was passed in -- indicating
                 # another mapping for the related Model.
-                val = self.verify_fk(feat, model_field, ogr_name)
+                if not self.faster_verify_fk:
+                    val = self.verify_fk(feat, model_field, ogr_name)
+                else:
+                    for rel_model_column_name, ogr_name_fk in ogr_name.items():
+                        # Seems not very helpful
+                        fk_val = self.verify_ogr_field(feat[ogr_name_fk], model_field)
+                        if fk_val not in self.fks_uid_pk_map[field_name]:
+                            # TODO: batch matching to report all missing fk ids
+                            raise Exception(
+                                f"Missing {field_name} foreign key ids: {fk_val}"
+                            )
+                        else:
+                            rel_model_pk = self.fks_uid_pk_map[field_name][fk_val]
+                            val = rel_model_pk
+                            # TODO: Validate it is always correct
+                            field_name = f"{field_name}_id"
+                        # Should only have one key inside the dict
+                        break
             else:
                 # Otherwise, verify OGR Field type.
                 val = self.verify_ogr_field(feat[ogr_name], model_field)
@@ -461,6 +539,7 @@ class LayerMapping:
             val = ogr_field.value
         return val
 
+    # Will be removed
     def verify_fk(self, feat, rel_model, rel_mapping):
         """
         Given an OGR Feature, the related model and its dictionary mapping,
@@ -479,7 +558,8 @@ class LayerMapping:
 
         # Attempting to retrieve and return the related model.
         try:
-            return rel_model.objects.using(self.using).get(**fk_kwargs)
+            # Lighter query by only fetching pk
+            return rel_model.objects.using(self.using).only("pk").get(**fk_kwargs)
         except ObjectDoesNotExist:
             raise MissingForeignKey(
                 "No ForeignKey %s model found with keyword arguments: %s"
@@ -499,6 +579,10 @@ class LayerMapping:
         # Downgrade a 3D geom to a 2D one, if necessary.
         if self.coord_dim == 2 and geom.is_3d:
             geom.set_3d(False)
+
+        # Downgrade a curved geom to a linear one so that it can be saved
+        if geom.has_curve:
+            geom = geom.get_linear_geometry()
 
         if self.make_multi(geom.geom_type, model_field):
             # Constructing a multi-geometry type to contain the single geometry
@@ -541,6 +625,11 @@ class LayerMapping:
         Return the GeometryField instance associated with the geographic
         column.
         """
+
+        # Allow layer has no geometry field being mapped
+        if self.geom_field is None:
+            return None
+
         # Use `get_field()` on the model's options so that we
         # get the correct field instance if there's model inheritance.
         opts = self.model._meta
@@ -616,6 +705,9 @@ class LayerMapping:
                 progress_interval = 1000
             else:
                 progress_interval = progress
+
+        if self.faster_verify_fk:
+            self.load_fks_uid_pk_map()
 
         def _save(feat_range=default_range, num_feat=0, num_saved=0):
             if feat_range:
@@ -735,3 +827,107 @@ class LayerMapping:
         else:
             # Otherwise, just calling the previously defined _save() function.
             _save()
+
+    def _split_layer(self, batch_size: int = 1000):
+        """
+        Split the features in the layer into batches of the given size.
+        """
+        iterator = iter(self.layer)
+        while batch := list(islice(iterator, batch_size)):
+            yield batch
+
+    def _bulk_create_batch(
+        self,
+        features_batch: list[Feature],
+        filter_func: Callable[[Feature], bool] = default_filter_func,
+        overwrite_kwargs: Optional[dict[str, Any]] = None,
+        ignore_conflicts: bool = False,
+    ):
+        """
+        Given a batch of features, bulk create these features.
+
+        Return number of features created
+        """
+
+        parent_models = self.model._meta.get_parent_list()
+
+        if not overwrite_kwargs:
+            overwrite_kwargs = {}
+
+        if self.faster_verify_fk:
+            features_kwargs = [
+                {**self.feature_kwargs(feature), **overwrite_kwargs}
+                for feature in features_batch
+                if filter_func(feature)
+            ]
+            # Verify FK existence
+            for fk_field_name in self.fk_field_names:
+                uids = [kwargs[fk_field_name + "_id"] for kwargs in features_kwargs]
+                if missing_uids := set(uids) - set(
+                    self.fks_uid_pk_map[fk_field_name].values()
+                ):
+                    raise Exception(
+                        f"Missing {fk_field_name} foreign key ids: {missing_uids}"
+                    )
+            features = [self.model(**kwargs) for kwargs in features_kwargs]
+        else:
+            features = [
+                self.model(**{**self.feature_kwargs(feature), **overwrite_kwargs})
+                for feature in features_batch
+                if filter_func(feature)
+            ]
+        if len(parent_models) > 0:
+            for feature in features:
+                feature.save(using=self.using)
+            # TODO: Implement bulk create, the following code is not working
+            # parent_model = parent_models[0]
+            # parent_field = self.model._meta.parents[parent_model]
+            # local_fields = self.model._meta.local_fields
+
+            # parent_instances = [parent_model() for _ in range(len(features))]
+            # parent_model.objects.using(self.using).bulk_create(
+            #     parent_instances, ignore_conflicts=ignore_conflicts
+            # )
+            # for feature, parent_instance in zip(features, parent_instances):
+            #     setattr(feature, parent_field.name, parent_instance)
+
+            # queryset = QuerySet(self.model)
+            # queryset._for_write = True
+            # with transaction.atomic(using=queryset.db, savepoint=False):
+            #     queryset._batched_insert(
+            #         features,
+            #         local_fields,
+            #         batch_size=None,
+            #     )
+        else:
+            self.model.objects.using(self.using).bulk_create(
+                features, ignore_conflicts=ignore_conflicts
+            )
+        return len(features)
+
+    def bulk_create_all(
+        self,
+        filter_func: Optional[Callable[[Feature], bool]] = None,
+        overwrite_kwargs: Optional[dict[str, Any]] = None,
+        batch_size: int = 1000,
+        ignore_conflicts: bool = False,
+    ):
+        if self.faster_verify_fk:
+            self.load_fks_uid_pk_map()
+
+        context = (
+            transaction.atomic()
+            if self.transaction_mode == "commit_on_success"
+            else nullcontext()
+        )
+        total_count = 0
+        with context:
+            for features_batch in self._split_layer(batch_size):
+                created_count = self._bulk_create_batch(
+                    features_batch,
+                    filter_func=filter_func or default_filter_func,
+                    overwrite_kwargs=overwrite_kwargs,
+                    ignore_conflicts=ignore_conflicts,
+                )
+                total_count += created_count
+                print(f"Bulk created {total_count} features so far...")
